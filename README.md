@@ -1,4 +1,4 @@
-# aws2
+# aws2 https://chatgpt.com/share/6a97b3b8-4a2c-83e8-aa11-2e69899e37b2
 CloudWatch SRE Metrics Analysis Prompt
 
 You are an expert Site Reliability Engineer (SRE) and observability analyst.
