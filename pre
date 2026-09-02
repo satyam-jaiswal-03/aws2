@@ -1,0 +1,452 @@
+Implement a production-quality AWS CloudWatch metric preprocessing module in Java 17/Spring Boot using AWS SDK for Java v2.
+
+The purpose of the module is to prepare CloudWatch time-series data for a downstream LLM that performs trend analysis.
+
+The preprocessing must support ANY analysis period.
+
+Examples:
+
+* 1 hour
+* 6 hours
+* 12 hours
+* 24 hours
+* 3 days
+* 7 days
+* 14 days
+* 30 days
+
+The preprocessing must NOT assume that the analysis is always daily.
+
+==================================================
+
+1. INPUT
+    ==================================================
+
+Input contains:
+
+* analysisStart
+* analysisEnd
+* requested analysis duration
+* AWS region
+* service
+* resource/dimensions
+* metric name
+* metric unit
+* raw CloudWatch timestamps
+* raw CloudWatch values
+* metric aggregation type
+* optional threshold configuration
+
+Example:
+
+{
+“analysisStart”: “2026-08-27T00:00:00Z”,
+“analysisEnd”: “2026-09-02T23:59:59Z”,
+“region”: “ap-south-1”,
+“metricName”: “5xx”,
+“unit”: “Count”,
+“aggregation”: “SUM”,
+“dataPoints”: […]
+}
+
+==================================================
+2. DYNAMIC GRANULARITY
+
+Determine analysis bucket size from the requested analysis duration.
+
+Use configurable defaults:
+
+<= 1 hour:
+5 minute buckets
+
+1 hour and <= 6 hours:
+15 minute buckets
+
+6 hours and <= 24 hours:
+1 hour buckets
+
+1 day and <= 3 days:
+6 hour buckets
+
+3 days and <= 14 days:
+1 day buckets
+
+14 days and <= 60 days:
+1 day or 6 hour buckets depending on datapoint volume
+
+60 days:
+1 week buckets
+
+Make all bucket sizes configurable.
+
+The output must include:
+
+granularity
+bucketStart
+bucketEnd
+
+==================================================
+3. CLEAN RAW DATA
+
+Before aggregation:
+
+* sort timestamps
+* remove null timestamps
+* remove null values
+* remove NaN
+* remove infinite values
+* handle duplicate timestamps deterministically
+* do not fabricate missing datapoints
+* preserve missing-data information
+
+Return:
+
+originalDataPointCount
+validDataPointCount
+invalidDataPointCount
+missingDataPointCount
+
+==================================================
+4. BUCKET AGGREGATION
+
+Group datapoints into time buckets.
+
+For each bucket calculate appropriate statistics.
+
+Every bucket must contain:
+
+* bucketStart
+* bucketEnd
+* value
+* minimum
+* maximum
+* average
+* datapointCount
+
+For COUNT metrics such as:
+
+RequestCount
+2xx
+4xx
+5xx
+
+use SUM as the primary bucket value when configured.
+
+For latency metrics such as:
+
+ResponseTime
+TargetResponseTime
+
+use AVERAGE as the primary bucket value.
+
+Also preserve minimum and maximum.
+
+For utilization metrics such as:
+
+CPU
+Memory
+
+use AVERAGE as the primary bucket value and preserve maximum.
+
+Do not use one aggregation method for every metric.
+
+Aggregation must be configurable per metric.
+
+==================================================
+5. BUCKET-TO-BUCKET CHANGE
+
+For every bucket after the first, calculate:
+
+previousValue
+absoluteChange
+percentageChange
+direction
+
+Direction:
+
+INCREASED
+DECREASED
+UNCHANGED
+
+Formula:
+
+percentageChange =
+((currentValue - previousValue) / abs(previousValue)) * 100
+
+If previousValue == 0:
+
+return null for percentageChange unless both values are zero.
+
+==================================================
+6. OVERALL TREND
+
+Calculate the overall trend across the entire analysis period.
+
+Possible values:
+
+INCREASING
+DECREASING
+STABLE
+FLUCTUATING
+INSUFFICIENT_DATA
+
+Use:
+
+* linear regression slope
+* bucket-to-bucket changes
+* percentage change
+* variability
+* direction consistency
+
+Do not determine trend only from firstValue and lastValue.
+
+Example:
+
+100 → 110 → 120 → 150 → 200
+
+should be INCREASING.
+
+Example:
+
+100 → 150 → 100 → 150 → 100
+
+should be FLUCTUATING.
+
+==================================================
+7. TREND PHASES
+
+Identify meaningful phases in the time series.
+
+Possible phases:
+
+STABLE
+GRADUAL_INCREASE
+ACCELERATING_INCREASE
+GRADUAL_DECREASE
+ACCELERATING_DECREASE
+SPIKE
+DROP
+ELEVATED
+RECOVERING
+FLUCTUATING
+
+A phase must contain:
+
+* start
+* end
+* phase type
+* starting value
+* ending value
+* percentage change
+
+Do not create a new phase for every small fluctuation.
+
+==================================================
+8. SPIKES
+
+Detect significant spikes using a configurable rolling baseline.
+
+Do not use only the global average.
+
+For every significant spike return:
+
+* timestamp/bucket
+* value
+* baseline
+* deviationPercent
+* duration if determinable
+
+==================================================
+9. DROPS
+
+Detect significant downward anomalies using the same approach.
+
+Return:
+
+* timestamp/bucket
+* value
+* baseline
+* deviationPercent
+* duration
+
+==================================================
+10. THRESHOLD ANALYSIS
+
+Use only externally supplied thresholds.
+
+For every bucket determine whether threshold is breached.
+
+Return:
+
+* threshold
+* operator
+* breachCount
+* firstBreach
+* lastBreach
+* maximumValue
+* duration
+* breachType
+
+Breach types:
+
+NONE
+ISOLATED
+REPEATED
+SUSTAINED
+
+Group consecutive threshold-breaching buckets into a single event.
+
+==================================================
+11. DERIVED METRICS
+
+When required source metrics are available, calculate:
+
+5xxRate =
+5xx / RequestCount * 100
+
+4xxRate =
+4xx / RequestCount * 100
+
+2xxRate =
+2xx / RequestCount * 100
+
+requestsPerHost =
+RequestCount / HostCount
+
+errorsPerHost =
+(4xx + 5xx) / HostCount
+
+Handle division by zero.
+
+Derived metrics must also be converted into the same bucket structure and trend calculations.
+
+==================================================
+12. CROSS-METRIC ALIGNMENT
+
+Align metrics using the same bucket boundaries.
+
+For example:
+
+10:00–10:05
+
+RequestCount = 1000
+5xx = 10
+ResponseTime = 2.1
+
+10:05–10:10
+
+RequestCount = 1200
+5xx = 20
+ResponseTime = 2.8
+
+This allows the downstream LLM to identify temporal relationships.
+
+Calculate objective signals such as:
+
+* correlation
+* simultaneous increase
+* simultaneous decrease
+* simultaneous anomaly
+
+Do not perform root-cause analysis.
+
+==================================================
+13. REGIONAL INFORMATION
+
+Never remove:
+
+* region
+* service
+* resource
+* CloudWatch dimensions
+
+The downstream LLM must be able to determine WHERE a trend or event occurred.
+
+==================================================
+14. IMPORTANT EVENTS
+
+Preserve exact timestamps for:
+
+* spikes
+* drops
+* threshold breaches
+* trend changes
+* recovery
+
+Do not lose exact event timestamps when aggregating.
+
+==================================================
+15. OUTPUT
+
+Return this structure:
+
+{
+“analysis”: {
+“start”: “…”,
+“end”: “…”,
+“duration”: “…”,
+“granularity”: “1d”
+},
+
+“regions”: [
+{
+“region”: “…”,
+
+  "metrics": [
+    {
+      "metricName": "...",
+      "unit": "...",
+      "aggregation": "SUM",
+      "dataQuality": {
+        "originalDataPointCount": 0,
+        "validDataPointCount": 0,
+        "invalidDataPointCount": 0,
+        "missingDataPointCount": 0
+      },
+      "timeSeries": [
+        {
+          "bucketStart": "...",
+          "bucketEnd": "...",
+          "value": 0,
+          "minimum": 0,
+          "maximum": 0,
+          "average": 0,
+          "datapointCount": 0,
+          "previousValue": null,
+          "absoluteChange": null,
+          "percentageChange": null,
+          "direction": "START|INCREASED|DECREASED|UNCHANGED"
+        }
+      ],
+      "overallTrend": {
+        "direction": "INCREASING|DECREASING|STABLE|FLUCTUATING|INSUFFICIENT_DATA",
+        "strength": "WEAK|MODERATE|STRONG",
+        "slope": 0,
+        "percentageChange": 0
+      },
+      "trendPhases": [],
+      "spikes": [],
+      "drops": [],
+      "thresholdAnalysis": {}
+    }
+  ]
+}
+
+],
+
+“derivedMetrics”: [],
+
+“crossMetricSignals”: []
+}
+
+The output must be deterministic.
+
+Do not generate natural-language explanations.
+
+Do not infer causes.
+
+Do not invent datapoints.
+
+Do not invent thresholds.
+
+The output is intended to be consumed by another LLM for trend interpretation.
